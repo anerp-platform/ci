@@ -1,0 +1,157 @@
+# anerp 客户项目的 PR 检查（可复用 workflow）。客户项目的 .github/workflows/ci.yml 用
+#   uses: anerp-platform/ci/.github/workflows/check.yml@v<平台版本>
+# 调用它。这里只有步骤编排：检查规则在 @anerp-platform/cli（anerp check）里，随平台包发布；不含密钥和任何客户内容（ADR 0004）。
+# 源码在平台仓库的 ci/ 目录，平台发版时同步到 anerp-platform/ci 并打同样的版本标签。
+name: anerp check
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js 版本
+        type: string
+        default: '22'
+      coverage-threshold:
+        description: 单元测试覆盖率门槛（%），统计各模块的 src/domain/ 和 src/service/
+        type: number
+        default: 80
+      e2e:
+        description: 运行端到端冒烟（pnpm e2e）
+        type: boolean
+        default: true
+    secrets:
+      ANERP_READ_TOKEN:
+        description: 只读令牌：安装 @anerp-platform/* 的包、读插件仓库的平台文件
+        required: true
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+env:
+  # .npmrc 里 @anerp-platform 的 registry 用它认证
+  NODE_AUTH_TOKEN: ${{ secrets.ANERP_READ_TOKEN }}
+  # 迁移检查和集成测试用的 Postgres（下面的 service）：超级用户能建临时库；运行账号由"准备数据库"一步创建
+  DATABASE_MIGRATION_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+  DATABASE_RUNTIME_ROLE: erp_app
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      # 全部历史和标签：判断本分支新增的迁移、权限码，和 main 上的接口契约、最近的发布标签比较
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # pnpm 版本取自 package.json 的 packageManager
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+
+      - name: Turborepo cache
+        uses: actions/cache@v6
+        with:
+          path: .turbo/cache
+          key: turbo-${{ runner.os }}-${{ github.sha }}
+          restore-keys: turbo-${{ runner.os }}-
+
+      # 1. 安装依赖
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # 2. lint、格式、构建、类型检查（构建产物给后面的 anerp check、迁移和端到端用）
+      - name: Lint
+        run: pnpm lint
+      - name: Prettier
+        run: pnpm format:check
+      - name: Build
+        run: pnpm build
+      - name: Typecheck
+        run: pnpm typecheck
+
+      # 3. 平台规则：模块边界、写接口、Spec 对照、接口契约（7）、平台文件
+      - name: anerp check
+        run: pnpm anerp check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ANERP_READ_TOKEN: ${{ secrets.ANERP_READ_TOKEN }}
+
+      # 4. 单元测试与覆盖率
+      - name: Unit tests
+        run: pnpm test
+        env:
+          ANERP_COVERAGE_THRESHOLD: ${{ inputs.coverage-threshold }}
+
+      # 5. 迁移：空库、从最近的发布标签升级、注释、破坏性操作
+      - name: Prepare database
+        run: |
+          psql "$DATABASE_MIGRATION_URL" -v ON_ERROR_STOP=1 -c "CREATE ROLE erp_app LOGIN PASSWORD 'erp_app_ci'" -c "CREATE DATABASE erp"
+      - name: Migrations
+        run: pnpm anerp check --migrations --no-build
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      # 6. 集成测试（Testcontainers，用 runner 上的 Docker）
+      - name: Integration tests
+        run: pnpm test:integration
+
+      # 8. 端到端冒烟：迁移 erp 库，启动 api 和 web，跑 e2e/ 下的测试
+      - name: Install Chromium
+        if: inputs.e2e
+        run: pnpm exec playwright install --with-deps chromium
+      - name: End-to-end smoke
+        if: inputs.e2e
+        run: |
+          pnpm anerp migrate --no-build --seed
+          pnpm e2e
+        env:
+          DATABASE_MIGRATION_URL: postgres://postgres:postgres@127.0.0.1:5432/erp
+          DATABASE_URL: postgres://erp_app:erp_app_ci@127.0.0.1:5432/erp
+          CI: 'true'
+      - name: Upload end-to-end report
+        if: failure() && inputs.e2e
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: playwright-report
+          if-no-files-found: ignore
+
+      # 9. 安全扫描：依赖的高危漏洞、提交里的密钥
+      - name: Dependency audit
+        run: pnpm audit --audit-level high
+      - name: Secret scan
+        run: |
+          version=8.30.1
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${version}"
+          archive="gitleaks_${version}_linux_x64.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -sSfLO "$base/$archive"
+          curl -sSfL "$base/gitleaks_${version}_checksums.txt" | grep " $archive\$" | sha256sum -c -
+          tar -xzf "$archive" gitleaks
+          cd "$GITHUB_WORKSPACE"
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            range="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          else
+            range="${{ github.event.before }}..${{ github.sha }}"
+            git cat-file -e "${{ github.event.before }}^{commit}" 2>/dev/null || range="${{ github.sha }}"
+          fi
+          "$RUNNER_TEMP/gitleaks" git --redact --no-banner --log-opts="$range" .
