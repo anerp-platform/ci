@@ -15,15 +15,18 @@ jobs:
 1. 安装依赖；
 2. lint、Prettier、构建、类型检查；
 3. `anerp check`（含接口契约）；
-4. 单元测试和覆盖率；
+4. 单元测试和覆盖率，`domain/` 的变异测试（Stryker）；
 5. 迁移检查；
 6. 集成测试；
 7. 端到端冒烟；
 8. 依赖审计和密钥扫描。
 
+PR 和推到 main 时，单元测试只跑改动的包和经 package.json 依赖它们的包（`anerp test --affected`），变异测试只跑 `src/domain/` 或单元测试有改动的模块（`anerp mutate --base`）；集成测试和端到端每次全跑。客户项目的 `ci.yml` 还在每晚、推送 `v*` 标签和手动运行时调用这个 workflow，这时跑全部。
+
 输入：
 
 - `coverage-threshold`：覆盖率门槛，默认 80；
+- `mutation-threshold`：变异测试门槛，模块 `src/domain/` 的最低变异得分（%），默认 50；
 - `node-version`：默认 22；
 - `e2e`：是否运行端到端冒烟，默认运行。
 

@@ -15,6 +15,10 @@ on:
         description: 单元测试覆盖率门槛（%），统计各模块的 src/domain/ 和 src/service/
         type: number
         default: 80
+      mutation-threshold:
+        description: 变异测试的门槛：模块 src/domain/ 的最低变异得分（%，被测试发现的变异占比）
+        type: number
+        default: 50
       e2e:
         description: 运行端到端冒烟（pnpm e2e）
         type: boolean
@@ -95,11 +99,45 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           ANERP_READ_TOKEN: ${{ secrets.ANERP_READ_TOKEN }}
 
-      # 4. 单元测试与覆盖率
-      - name: Unit tests
-        run: pnpm test
+      # 4. 单元测试与覆盖率、domain/ 的变异测试。PR 和推到 main 只跑受影响的部分（和基准提交比较）；
+      #    定时、推版本标签、手动运行时没有基准，跑全部。基准提交不在历史里（如强制推送）时也跑全部
+      - name: Test scope
+        id: scope
+        run: |
+          base=""
+          case "$EVENT" in
+            pull_request) base="$PR_BASE" ;;
+            push) if [ "$REF_TYPE" = branch ]; then base="$BEFORE"; fi ;;
+          esac
+          if [ -n "$base" ] && ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "$base is not in the history; testing everything"
+            base=""
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          if [ -n "$base" ]; then echo "Affected scope: changes since $base"; else echo "Full run ($EVENT)"; fi
         env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          REF_TYPE: ${{ github.ref_type }}
+          BEFORE: ${{ github.event.before }}
+      - name: Unit tests
+        run: pnpm anerp test ${BASE:+--affected "$BASE"}
+        env:
+          BASE: ${{ steps.scope.outputs.base }}
           ANERP_COVERAGE_THRESHOLD: ${{ inputs.coverage-threshold }}
+      - name: Mutation tests
+        id: mutation
+        run: pnpm anerp mutate --threshold "$THRESHOLD" ${BASE:+--base "$BASE"}
+        env:
+          BASE: ${{ steps.scope.outputs.base }}
+          THRESHOLD: ${{ inputs.mutation-threshold }}
+      - name: Upload mutation report
+        if: failure() && steps.mutation.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutation-report
+          path: reports/mutation
+          if-no-files-found: ignore
 
       # 5. 迁移：空库、从最近的发布标签升级、注释、破坏性操作
       - name: Prepare database
