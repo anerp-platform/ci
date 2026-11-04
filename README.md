@@ -30,4 +30,16 @@ PR 和推到 main 时，单元测试只跑改动的包和经 package.json 依赖
 - `node-version`：默认 22；
 - `e2e`：是否运行端到端冒烟，默认运行。
 
+## infra.yml
+
+客户项目的 `.github/workflows/infra.yml`（`anerp init` 生成）调用它：改 `infra/` 的 PR 上 `terraform plan` 并把结果评论到 PR（一条评论，每次推送原地更新），合并到 main 后重新 plan 再 apply 到 dev。经 GitHub OIDC 扮演账号初始化建的角色，仓库里不存 AWS 密钥；仓库还没有角色的 secret 时跳过并在日志里说明。
+
+输入：`environment`（默认 `dev`，对应 `infra/envs/<环境名>/`）、`aws-region`（默认 `eu-west-2`）、`terraform-version`。secret：`ANERP_READ_TOKEN`（从平台仓库拉模块）、`AWS_PLAN_ROLE_ARN`、`AWS_APPLY_ROLE_ARN`、`TF_STATE_BUCKET`。
+
+## deploy.yml
+
+客户项目的 `ci.yml` 在 main 上的检查通过后调用它，部署到 dev：构建 api、web 镜像（标签是 commit SHA，默认在 `ubuntu-24.04-arm` 上构建）→ 镜像大小上限 → Trivy 扫描（高危及以上、有修复版本的阻断）→ 推到 ECR → `anerp deploy release`（迁移 → 冒烟账号 → 滚动更新 → 冒烟测试，失败回滚）。经 GitHub OIDC 扮演部署角色；仓库还没有 `AWS_DEPLOY_ROLE_ARN` 时跳过并在日志里说明。
+
+输入：`name`（环境前缀，如 `acme-dev`）、`aws-region`（默认 `eu-west-2`）、`runner`（默认 `ubuntu-24.04-arm`，CPU 架构要和环境一致）、`api-max-mb`（默认 400）、`web-max-mb`（默认 250）、`node-version`。secret：`ANERP_READ_TOKEN`、`AWS_DEPLOY_ROLE_ARN`。
+
 这个仓库只有 workflow 定义。检查规则在 `@anerp-platform/cli` 里，随平台包发布。源码在平台仓库的 `ci/` 目录，平台发版时同步到这里，并打相同的版本标签，不要直接在这里修改。

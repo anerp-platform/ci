@@ -1,0 +1,165 @@
+# anerp 客户项目的基础设施（可复用 workflow）。客户项目的 .github/workflows/infra.yml 用
+#   uses: anerp-platform/ci/.github/workflows/infra.yml@v<平台版本>
+# 调用它：改 infra/ 的 PR 上 terraform plan，并把结果评论到 PR（一条评论，每次推送原地更新）；
+# 合并到 main 后按 main 当前的代码重新 plan 再 apply（#13 决定 99、100）。
+# AWS 凭证经 GitHub OIDC 扮演账号初始化建的角色（PR 只能扮演只读的 plan 角色，main 才能扮演 apply 角色），仓库里不存 AWS 密钥。
+# 模块从私有的平台仓库按版本标签拉取，用只读令牌认证：令牌只经环境变量交给 git，不写进文件和日志。
+# 仓库还没有角色的 secret（AWS 还没初始化）时跳过并在日志里说明，不失败（决定 101）。
+# 源码在平台仓库的 ci/ 目录，平台发版时同步到 anerp-platform/ci 并打同样的版本标签。
+name: anerp infra
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 环境名，对应 infra/envs/<环境名>/
+        type: string
+        default: dev
+      aws-region:
+        description: 环境所在的 AWS 区域（和 infra/envs/<环境名>/main.tf 里的一致）
+        type: string
+        default: eu-west-2
+      terraform-version:
+        type: string
+        default: 1.15.5
+    secrets:
+      ANERP_READ_TOKEN:
+        description: 只读令牌：从平台仓库拉 Terraform 模块
+        required: true
+      AWS_PLAN_ROLE_ARN:
+        description: 账号初始化建的 plan 角色（PR 用，只读）
+        required: false
+      AWS_APPLY_ROLE_ARN:
+        description: 账号初始化建的 apply 角色（只有 main 能扮演）
+        required: false
+      TF_STATE_BUCKET:
+        description: 账号初始化建的状态桶（anerp-tfstate-<账号 ID>）
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DIR: infra/envs/${{ inputs.environment }}
+      # PR 上只 plan；推到 main（或在 main 上手动运行）才 apply
+      MODE: ${{ github.event_name == 'pull_request' && 'plan' || 'apply' }}
+      ROLE_ARN: ${{ github.event_name == 'pull_request' && secrets.AWS_PLAN_ROLE_ARN || secrets.AWS_APPLY_ROLE_ARN }}
+      TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+      TF_IN_AUTOMATION: 'true'
+      TF_INPUT: 'false'
+    steps:
+      - name: Check the AWS bootstrap
+        id: bootstrap
+        run: |
+          if [ "$MODE" = apply ] && [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::apply only runs on main (the apply role trusts only main); this run is on ${GITHUB_REF}."
+            exit 1
+          fi
+          if [ -z "$ROLE_ARN" ] || [ -z "$TF_STATE_BUCKET" ]; then
+            role=$([ "$MODE" = plan ] && echo AWS_PLAN_ROLE_ARN || echo AWS_APPLY_ROLE_ARN)
+            echo "::notice::Skipped: AWS is not bootstrapped for this repository yet (secret ${role} or TF_STATE_BUCKET is not set). See docs/aws-bootstrap.md in the platform repository."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v7
+        if: steps.bootstrap.outputs.ready == 'true'
+
+      - uses: hashicorp/setup-terraform@v4
+        if: steps.bootstrap.outputs.ready == 'true'
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        if: steps.bootstrap.outputs.ready == 'true'
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: terraform init
+        if: steps.bootstrap.outputs.ready == 'true'
+        env:
+          # 只对这一步：git 拉 github.com/anerp-platform/ 下的模块时带上只读令牌（经环境变量，不写 .gitconfig）
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: url.https://x-access-token:${{ secrets.ANERP_READ_TOKEN }}@github.com/anerp-platform/.insteadOf
+          GIT_CONFIG_VALUE_0: https://github.com/anerp-platform/
+        run: terraform -chdir="$DIR" init -backend-config="bucket=${TF_STATE_BUCKET}"
+
+      - name: terraform fmt and validate
+        if: steps.bootstrap.outputs.ready == 'true'
+        run: |
+          terraform fmt -check -recursive infra
+          terraform -chdir="$DIR" validate
+
+      # PR 上不加锁：plan 角色只读，写不了锁文件；也不会和 main 上的 apply 互相等待
+      - name: terraform plan
+        if: steps.bootstrap.outputs.ready == 'true'
+        id: plan
+        run: |
+          lock=$([ "$MODE" = plan ] && echo false || echo true)
+          terraform -chdir="$DIR" plan -lock="$lock" -no-color -out=tfplan
+          terraform -chdir="$DIR" show -no-color tfplan > "$RUNNER_TEMP/plan.txt"
+
+      - name: Comment the plan on the pull request
+        if: steps.bootstrap.outputs.ready == 'true' && env.MODE == 'plan'
+        uses: actions/github-script@v9
+        env:
+          PLAN_FILE: ${{ runner.temp }}/plan.txt
+          ENVIRONMENT: ${{ inputs.environment }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const plan = fs.readFileSync(process.env.PLAN_FILE, 'utf8');
+            const environment = process.env.ENVIRONMENT;
+            const marker = `<!-- anerp-infra-plan:${environment} -->`;
+            const sha = context.payload.pull_request.head.sha;
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            // 一行统计，和每个要变的资源（删除、替换的最需要注意）
+            const summary = (plan.match(/^(Plan: .+|No changes\..*)$/m) ?? ['(no summary line in the plan)'])[0];
+            const signs = { 'will be created': '+', 'will be updated in-place': '~', 'will be destroyed': '-', 'must be replaced': '-/+', 'will be read during apply': '<=' };
+            const changes = [...plan.matchAll(/^ {2}# (\S+) (?:is tainted, so )?(will be created|will be updated in-place|will be destroyed|must be replaced|will be read during apply)/gm)]
+              .filter((m) => m[2] !== 'will be read during apply')
+              .map((m) => `- \`${signs[m[2]]}\` \`${m[1]}\``);
+            const destructive = changes.filter((line) => line.startsWith('- `-')).length;
+
+            // GitHub 评论最长 65536 字符：完整 plan 折叠起来，太长就截断，完整内容在运行日志里
+            const LIMIT = 50000;
+            const full = plan.length > LIMIT ? `${plan.slice(0, LIMIT)}\n… (truncated: see the full plan in the run log)` : plan;
+            const body = [
+              marker,
+              `### terraform plan (${environment}) · ${sha.slice(0, 7)}`,
+              '',
+              `**${summary}**${destructive > 0 ? ` ⚠️ ${destructive} resource(s) destroyed or replaced` : ''}`,
+              '',
+              ...changes.slice(0, 100),
+              ...(changes.length > 100 ? [`- … and ${changes.length - 100} more`] : []),
+              '',
+              '<details><summary>Full plan</summary>',
+              '',
+              '```',
+              full,
+              '```',
+              '</details>',
+              '',
+              `[Run log](${run}) · applied after merge to main`,
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
+            const existing = comments.find((c) => c.user?.type === 'Bot' && c.body?.startsWith(marker));
+            if (existing) await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            else await github.rest.issues.createComment({ owner, repo, issue_number, body });
+
+      - name: terraform apply
+        if: steps.bootstrap.outputs.ready == 'true' && env.MODE == 'apply'
+        run: terraform -chdir="$DIR" apply -no-color tfplan

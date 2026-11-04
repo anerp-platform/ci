@@ -1,0 +1,181 @@
+# anerp 客户项目部署到 dev（可复用 workflow）。客户项目的 .github/workflows/ci.yml 在 main 上的检查通过后用
+#   uses: anerp-platform/ci/.github/workflows/deploy.yml@v<平台版本>
+# 调用它（#13 决定 102）：
+# 1. 构建 api、web 镜像（标签是 commit SHA，在 ARM 运行器上原生构建，和 Fargate 的 ARM64 一致）；
+# 2. 镜像大小上限（超过时列出和当前部署的镜像比增长最多的依赖）和 Trivy 扫描（高危及以上、有修复版本的阻断）；
+# 3. 推到 ECR；
+# 4. anerp deploy release：注册任务定义 → 迁移（失败就停，服务不更新）→ 冒烟账号 → 滚动更新 api、web（断路器回滚）
+#    → 经 CloudFront 冒烟测试（失败回滚到上一个任务定义）。
+# AWS 凭证经 GitHub OIDC 扮演账号初始化建的部署角色（只信任 main，权限按资源收窄），仓库里不存 AWS 密钥；
+# 仓库还没有部署角色的 secret 时跳过并在日志里说明。
+# 源码在平台仓库的 ci/ 目录，平台发版时同步到 anerp-platform/ci 并打同样的版本标签。
+name: anerp deploy
+
+on:
+  workflow_call:
+    inputs:
+      name:
+        description: 环境前缀（infra/envs/dev 里的 name，如 acme-dev）
+        type: string
+        required: true
+      aws-region:
+        type: string
+        default: eu-west-2
+      runner:
+        description: 构建镜像的运行器，CPU 架构要和环境的 cpu_architecture 一致（ARM64 → ubuntu-24.04-arm）
+        type: string
+        default: ubuntu-24.04-arm
+      api-max-mb:
+        description: api 镜像的大小上限（MB）
+        type: number
+        default: 400
+      web-max-mb:
+        description: web 镜像的大小上限（MB）
+        type: number
+        default: 250
+      node-version:
+        type: string
+        default: '22'
+    secrets:
+      ANERP_READ_TOKEN:
+        description: 只读令牌：安装 @anerp-platform/* 的包（构建镜像和 anerp CLI）
+        required: true
+      AWS_DEPLOY_ROLE_ARN:
+        description: 账号初始化建的部署角色（只有 main 能扮演）
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+    # 同一个环境一次只部署一个版本，后来的排队
+    concurrency:
+      group: anerp-deploy-${{ inputs.name }}
+      cancel-in-progress: false
+    env:
+      NAME: ${{ inputs.name }}
+      AWS_REGION: ${{ inputs.aws-region }}
+      TAG: ${{ github.sha }}
+      ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+      # .npmrc 里 @anerp-platform 的 registry 用它认证；docker build 经 BuildKit secret 拿到它
+      NODE_AUTH_TOKEN: ${{ secrets.ANERP_READ_TOKEN }}
+    steps:
+      - name: Check the AWS bootstrap
+        id: bootstrap
+        run: |
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::deploy only runs on main (the deploy role trusts only main); this run is on ${GITHUB_REF}."
+            exit 1
+          fi
+          if [ -z "$ROLE_ARN" ]; then
+            echo "::notice::Skipped: AWS is not bootstrapped for this repository yet (secret AWS_DEPLOY_ROLE_ARN is not set). See docs/aws-bootstrap.md in the platform repository."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v7
+        if: steps.bootstrap.outputs.ready == 'true'
+
+      # pnpm 版本取自 package.json 的 packageManager
+      - uses: pnpm/action-setup@v6
+        if: steps.bootstrap.outputs.ready == 'true'
+
+      - uses: actions/setup-node@v7
+        if: steps.bootstrap.outputs.ready == 'true'
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+
+      # 只为 anerp CLI（anerp deploy）；镜像在 Docker 里自己安装依赖
+      - name: Install
+        if: steps.bootstrap.outputs.ready == 'true'
+        run: pnpm install --frozen-lockfile
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        if: steps.bootstrap.outputs.ready == 'true'
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Log in to ECR
+        if: steps.bootstrap.outputs.ready == 'true'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # 标签不可变：同一个提交重跑时镜像已经在 ECR 里（之前已经通过大小和扫描检查），直接部署
+      - name: Images already pushed?
+        if: steps.bootstrap.outputs.ready == 'true'
+        id: existing
+        run: |
+          if aws ecr describe-images --repository-name "${NAME}-api" --image-ids imageTag="$TAG" > /dev/null 2>&1 \
+            && aws ecr describe-images --repository-name "${NAME}-web" --image-ids imageTag="$TAG" > /dev/null 2>&1; then
+            echo "::notice::The images for ${TAG} are already in ECR; deploying them."
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        if: steps.bootstrap.outputs.ready == 'true' && steps.existing.outputs.pushed == 'false'
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          for app in api web; do
+            echo "::group::$app"
+            docker build -f "apps/$app/Dockerfile" --secret id=NODE_AUTH_TOKEN,env=NODE_AUTH_TOKEN -t "${REGISTRY}/${NAME}-${app}:${TAG}" .
+            echo "::endgroup::"
+          done
+
+      - name: Image size
+        if: steps.bootstrap.outputs.ready == 'true' && steps.existing.outputs.pushed == 'false'
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          API_MAX_MB: ${{ inputs.api-max-mb }}
+          WEB_MAX_MB: ${{ inputs.web-max-mb }}
+        run: |
+          status=0
+          pnpm anerp deploy image-size --name "$NAME" --region "$AWS_REGION" --service api --image "${REGISTRY}/${NAME}-api:${TAG}" --max-mb "$API_MAX_MB" || status=1
+          pnpm anerp deploy image-size --name "$NAME" --region "$AWS_REGION" --service web --image "${REGISTRY}/${NAME}-web:${TAG}" --max-mb "$WEB_MAX_MB" || status=1
+          exit "$status"
+
+      # Trivy 的二进制按发布的校验和核对后使用（不用第三方 action）
+      - name: Vulnerability scan
+        if: steps.bootstrap.outputs.ready == 'true' && steps.existing.outputs.pushed == 'false'
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          version=0.76.1
+          arch=$([ "$(uname -m)" = aarch64 ] && echo ARM64 || echo 64bit)
+          base="https://github.com/aquasecurity/trivy/releases/download/v${version}"
+          archive="trivy_${version}_Linux-${arch}.tar.gz"
+          (cd "$RUNNER_TEMP" && curl -sSfLO "$base/$archive" && curl -sSfL "$base/trivy_${version}_checksums.txt" | grep " $archive\$" | sha256sum -c - && tar -xzf "$archive" trivy)
+          status=0
+          for app in api web; do
+            echo "::group::$app"
+            "$RUNNER_TEMP/trivy" image --quiet --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "${REGISTRY}/${NAME}-${app}:${TAG}" || status=1
+            echo "::endgroup::"
+          done
+          if [ "$status" != 0 ]; then
+            echo "::error::High or critical vulnerabilities with a fix are in the images (listed above): upgrade the dependency or the base image."
+          fi
+          exit "$status"
+
+      - name: Push
+        if: steps.bootstrap.outputs.ready == 'true' && steps.existing.outputs.pushed == 'false'
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          for app in api web; do
+            docker push --quiet "${REGISTRY}/${NAME}-${app}:${TAG}"
+          done
+
+      - name: Release
+        if: steps.bootstrap.outputs.ready == 'true'
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: pnpm anerp deploy release --name "$NAME" --region "$AWS_REGION" --registry "$REGISTRY" --tag "$TAG"
