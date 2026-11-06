@@ -4,7 +4,7 @@
 # 1. 构建 api、web 镜像（标签是 commit SHA，在 ARM 运行器上原生构建，和 Fargate 的 ARM64 一致）；
 # 2. 镜像大小上限（超过时列出和当前部署的镜像比增长最多的依赖）和 Trivy 扫描（高危及以上、有修复版本的阻断）；
 # 3. 推到 ECR；
-# 4. anerp deploy release：注册任务定义 → 迁移（失败就停，服务不更新）→ 冒烟账号 → 滚动更新 api、web（断路器回滚）
+# 4. anerp deploy release：注册任务定义 → 迁移（失败就停，服务不更新）→ 冒烟账号 → 滚动更新 api、web、worker（断路器回滚）
 #    → 经 CloudFront 冒烟测试（失败回滚到上一个任务定义）。
 # AWS 凭证经 GitHub OIDC 扮演账号初始化建的部署角色（只信任 main，权限按资源收窄），仓库里不存 AWS 密钥；
 # 仓库还没有部署角色的 secret 时跳过并在日志里说明。
