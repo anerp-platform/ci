@@ -148,12 +148,16 @@ jobs:
         if: steps.bootstrap.outputs.ready == 'true' && steps.existing.outputs.pushed == 'false'
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
+          # 先带令牌下载（GitHub 对匿名下载限流时不受影响），不行（例如对方组织开了 IP 白名单）再匿名下载
+          GH_TOKEN: ${{ github.token }}
         run: |
           version=0.76.1
           arch=$([ "$(uname -m)" = aarch64 ] && echo ARM64 || echo 64bit)
-          base="https://github.com/aquasecurity/trivy/releases/download/v${version}"
           archive="trivy_${version}_Linux-${arch}.tar.gz"
-          (cd "$RUNNER_TEMP" && curl -sSfLO "$base/$archive" && curl -sSfL "$base/trivy_${version}_checksums.txt" | grep " $archive\$" | sha256sum -c - && tar -xzf "$archive" trivy)
+          for f in "$archive" "trivy_${version}_checksums.txt"; do
+            gh release download "v${version}" --repo aquasecurity/trivy --dir "$RUNNER_TEMP" --pattern "$f" || curl -sSfL --retry 5 --retry-all-errors -o "$RUNNER_TEMP/$f" "https://github.com/aquasecurity/trivy/releases/download/v${version}/$f"
+          done
+          (cd "$RUNNER_TEMP" && grep " $archive\$" "trivy_${version}_checksums.txt" | sha256sum -c - && tar -xzf "$archive" trivy)
           status=0
           for app in api web; do
             echo "::group::$app"
