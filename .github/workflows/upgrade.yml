@@ -21,7 +21,7 @@ on:
         description: 只读令牌：安装 @anerp-platform/* 的包
         required: true
       ANERP_UPGRADE_TOKEN:
-        description: 本仓库的令牌（Contents、Pull requests、Issues、Workflows 读写，Checks、Commit statuses 只读）：推升级分支、开 PR、合并。用它而不用 GITHUB_TOKEN，PR 的检查才会运行
+        description: 本仓库的令牌（Contents、Pull requests、Issues、Workflows 读写，Actions 只读）：推升级分支、开 PR、合并。用它而不用 GITHUB_TOKEN，PR 的检查才会运行
         required: false
 
 # anerp check 读豁免引用的 issue
@@ -153,6 +153,7 @@ jobs:
             echo "clean=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # 等 PR 触发的 workflow 都跑完再合并。经 Actions 接口读（令牌要 Actions 只读）：PR 的检查汇总要 Checks 权限，细粒度令牌没有这一项。
       # 不用 GitHub 的自动合并：它要分支保护和必需的检查（私有仓库要付费计划），没有必需的检查时会立即合并
       - name: Wait for the checks and merge
         if: steps.pr.outputs.clean == 'true'
@@ -161,23 +162,35 @@ jobs:
           GH_TOKEN: ${{ secrets.ANERP_UPGRADE_TOKEN }}
           URL: ${{ steps.pr.outputs.url }}
         run: |
+          sha=$(git rev-parse HEAD)
+          runs="repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${sha}&event=pull_request&per_page=100"
+          # 每个 workflow 只看最新的一次运行（重新运行、被新运行取消的不算）
+          latest='[.workflow_runs | group_by(.workflow_id)[] | max_by(.run_number)]'
+          give_up() {
+            echo "::error::$1"
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
           # 推送后检查要过一会儿才出现（GitHub 忙时要好几分钟），最多等 30 分钟
+          found=0
           for _ in $(seq 1 180); do
-            if checks=$(gh pr view "$URL" --json statusCheckRollup --jq '.statusCheckRollup | length' 2>&1); then
-              [ "$checks" -gt 0 ] && break
-            elif echo "$checks" | grep -q 'not accessible'; then
-              # 令牌读不了检查：等多久都一样，直接说缺什么
-              echo "::error::ANERP_UPGRADE_TOKEN cannot read the PR's checks (${checks}). Give the token read access to Checks and Commit statuses, then delete the upgrade branch and run this workflow again."
-              echo "merged=false" >> "$GITHUB_OUTPUT"
-              exit 0
+            if out=$(gh api "$runs" --jq '.total_count' 2>&1); then
+              found=$out
+              [ "$found" -gt 0 ] && break
+            elif echo "$out" | grep -qiE 'not accessible|HTTP 403'; then
+              # 令牌读不了：等多久都一样，直接说缺什么
+              give_up "ANERP_UPGRADE_TOKEN cannot read this repository's workflow runs (${out}). Give the token read access to Actions, then delete the upgrade branch and run this workflow again."
             fi
             sleep 10
           done
-          if gh pr checks "$URL" --watch --interval 60 && gh pr merge "$URL" --merge --delete-branch; then
-            echo "merged=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "merged=false" >> "$GITHUB_OUTPUT"
-          fi
+          [ "$found" -gt 0 ] || give_up "No workflow run started for the upgrade PR in 30 minutes."
+          while [ "$(gh api "$runs" --jq "${latest} | map(select(.status != \"completed\")) | length" || echo 1)" != 0 ]; do
+            sleep 60
+          done
+          failed=$(gh api "$runs" --jq "${latest} | map(select(.conclusion != \"success\" and .conclusion != \"skipped\" and .conclusion != \"neutral\")) | map(.name) | join(\", \")")
+          [ -z "$failed" ] || give_up "The upgrade PR's checks did not pass: ${failed}."
+          gh pr merge "$URL" --merge --delete-branch || give_up "The upgrade PR could not be merged (see above)."
+          echo "merged=true" >> "$GITHUB_OUTPUT"
 
       - name: Ask for attention
         if: steps.pr.outputs.url != '' && steps.merge.outputs.merged != 'true'
