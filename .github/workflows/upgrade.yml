@@ -1,0 +1,192 @@
+# anerp 客户项目的平台升级（可复用 workflow，#255）。客户项目的 .github/workflows/upgrade.yml 用
+#   uses: anerp-platform/ci/.github/workflows/upgrade.yml@v<平台版本>
+# 调用它：有新的平台版本时在 GitHub 的运行器上运行 anerp upgrade，开 PR，等 PR 的检查都通过后合并。
+# 升级要人处理、检查失败或合并不了时不合并，PR 加上 upgrade-needs-attention 标签，并评论要做什么。
+# 源码在平台仓库的 ci/ 目录，平台发版时同步到 anerp-platform/ci 并打同样的版本标签。
+name: anerp upgrade
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 要升级到的平台版本；空的时候取 @anerp-platform/cli 的最新版本
+        type: string
+        default: ''
+      node-version:
+        description: Node.js 版本
+        type: string
+        default: '22'
+    secrets:
+      ANERP_READ_TOKEN:
+        description: 只读令牌：安装 @anerp-platform/* 的包
+        required: true
+      ANERP_UPGRADE_TOKEN:
+        description: 本仓库的令牌（Contents、Pull requests、Issues、Workflows 读写）：推升级分支、开 PR、合并。用它而不用 GITHUB_TOKEN，PR 的检查才会运行
+        required: false
+
+# anerp check 读豁免引用的 issue
+permissions:
+  contents: read
+  issues: read
+
+env:
+  LABEL: upgrade-needs-attention
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check the upgrade token
+        id: token
+        env:
+          TOKEN: ${{ secrets.ANERP_UPGRADE_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::notice::Skipped: secret ANERP_UPGRADE_TOKEN is not set, so the upgrade cannot open a PR. See the anerp-platform/ci README."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 写令牌不留在 .git/config：安装和测试会运行项目的依赖，只有推送和 gh 的几步拿到它
+      - uses: actions/checkout@v7
+        if: steps.token.outputs.ready == 'true'
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          # anerp check 和 git 历史比较（接口契约、迁移）
+          fetch-depth: 0
+          persist-credentials: false
+
+      # pnpm 版本取自 package.json 的 packageManager
+      - uses: pnpm/action-setup@v6
+        if: steps.token.outputs.ready == 'true'
+
+      - uses: actions/setup-node@v7
+        if: steps.token.outputs.ready == 'true'
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Target version
+        if: steps.token.outputs.ready == 'true'
+        id: target
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.ANERP_READ_TOKEN }}
+          GH_TOKEN: ${{ secrets.ANERP_UPGRADE_TOKEN }}
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          current=$(jq -r '[.dependencies // {}, .devDependencies // {}] | add | .["@anerp-platform/cli"] // empty' package.json)
+          if [ -z "$current" ]; then
+            echo "::error::package.json has no @anerp-platform/cli dependency; run this workflow in a project set up with anerp init."
+            exit 1
+          fi
+          # .npmrc 里 @anerp-platform 的 registry
+          target=${REQUESTED:-$(pnpm view @anerp-platform/cli version)}
+          branch="upgrade-platform-${target}"
+          echo "On ${current}, latest ${target}."
+          if [ "$target" = "$current" ]; then
+            echo "::notice::Already on ${target}."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          elif gh api "repos/${GITHUB_REPOSITORY}/branches/${branch}" --silent 2> /dev/null; then
+            echo "::notice::Branch ${branch} already exists (an open upgrade PR, or one closed without deleting the branch). Merge it, or delete the branch to upgrade again."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            { echo "run=true"; echo "version=${target}"; echo "branch=${branch}"; } >> "$GITHUB_OUTPUT"
+          fi
+
+      # 由目标版本的 CLI 执行：codemod、改版本号、安装、构建、anerp check、单元测试。步骤失败时退出码非 0，结果仍写在报告里
+      - name: anerp upgrade
+        if: steps.target.outputs.run == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.ANERP_READ_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          report="$RUNNER_TEMP/upgrade.json"
+          pnpm dlx "@anerp-platform/cli@${VERSION}" upgrade "$VERSION" --report "$report" || true
+          if [ ! -f "$report" ]; then
+            echo "::error::anerp upgrade stopped before it changed anything; see its output above."
+            exit 1
+          fi
+          jq -r .summary "$report" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push the upgrade branch
+        if: steps.target.outputs.run == 'true'
+        env:
+          BRANCH: ${{ steps.target.outputs.branch }}
+          VERSION: ${{ steps.target.outputs.version }}
+          GIT_CONFIG_COUNT: 1
+          GIT_CONFIG_KEY_0: url.https://x-access-token:${{ secrets.ANERP_UPGRADE_TOKEN }}@github.com/.insteadOf
+          GIT_CONFIG_VALUE_0: https://github.com/
+        run: |
+          git switch -c "$BRANCH"
+          git add -A
+          git -c user.name='anerp upgrade' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -q -m "chore: upgrade the platform to ${VERSION}"
+          git push -q origin "$BRANCH"
+
+      - name: Open the PR
+        if: steps.target.outputs.run == 'true'
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.ANERP_UPGRADE_TOKEN }}
+          BRANCH: ${{ steps.target.outputs.branch }}
+          VERSION: ${{ steps.target.outputs.version }}
+          BASE: ${{ github.event.repository.default_branch }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          report="$RUNNER_TEMP/upgrade.json"
+          body="$RUNNER_TEMP/body.md"
+          {
+            echo "Platform upgrade to ${VERSION}, by the upgrade workflow ([run](${RUN_URL}))."
+            echo
+            echo '```'
+            jq -r .summary "$report"
+            echo '```'
+          } > "$body"
+          url=$(gh pr create --base "$BASE" --head "$BRANCH" --title "Upgrade the platform to ${VERSION}" --body-file "$body")
+          echo "url=${url}" >> "$GITHUB_OUTPUT"
+          if [ "$(jq -r .passed "$report")" = true ] && [ "$(jq -r .manualCount "$report")" = 0 ]; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 不用 GitHub 的自动合并：它要分支保护和必需的检查（私有仓库要付费计划），没有必需的检查时会立即合并
+      - name: Wait for the checks and merge
+        if: steps.pr.outputs.clean == 'true'
+        id: merge
+        env:
+          GH_TOKEN: ${{ secrets.ANERP_UPGRADE_TOKEN }}
+          URL: ${{ steps.pr.outputs.url }}
+        run: |
+          # 推送后检查要过一会儿才出现
+          for _ in $(seq 1 30); do
+            checks=$(gh pr view "$URL" --json statusCheckRollup --jq '.statusCheckRollup | length' || echo 0)
+            [ "${checks:-0}" -gt 0 ] && break
+            sleep 10
+          done
+          if gh pr checks "$URL" --watch --interval 60 && gh pr merge "$URL" --merge --delete-branch; then
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ask for attention
+        if: steps.pr.outputs.url != '' && steps.merge.outputs.merged != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.ANERP_UPGRADE_TOKEN }}
+          URL: ${{ steps.pr.outputs.url }}
+          BRANCH: ${{ steps.target.outputs.branch }}
+          CLEAN: ${{ steps.pr.outputs.clean }}
+        run: |
+          gh label create "$LABEL" --color D93F0B --description 'The platform upgrade needs a person or Claude' --force > /dev/null
+          gh pr edit "$URL" --add-label "$LABEL" > /dev/null
+          if [ "$CLEAN" = true ]; then
+            reason="The upgrade itself passed, but the PR's checks failed or the PR could not be merged (see the checks and the workflow run)."
+          else
+            reason="anerp upgrade did not pass on its own: a step failed or a change has to be made by hand (see \"Steps\" and \"Needs a manual change\" in the summary above)."
+          fi
+          gh pr comment "$URL" --body "${reason}
+
+          To finish it: check out \`${BRANCH}\`, make the fixes the summary and the failed checks ask for, run the same checks locally (\`pnpm build\`, \`pnpm anerp check\`, \`pnpm test\`), push to this branch, and merge the PR when its checks pass. Do not upgrade again on another branch."
+          echo "::warning::The upgrade PR needs attention: ${URL}"
