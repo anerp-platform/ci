@@ -57,7 +57,7 @@ PR 和推到 main 时，单元测试只跑改动的包和经 package.json 依赖
 输入：`version`（默认空，即最新版本）、`node-version`。secret：
 
 - `ANERP_READ_TOKEN`：同上，安装 `@anerp-platform/*`；
-- `ANERP_UPGRADE_TOKEN`：只对本仓库的细粒度令牌（或 GitHub App 的令牌），权限 Contents、Pull requests、Issues、Workflows 读写（升级会改 `.github/workflows/` 里的版本号，所以要 Workflows）。用它推分支、开 PR、合并：`GITHUB_TOKEN` 开的 PR 不会触发检查。它只交给推送和 `gh` 的几步，不进 `.git/config`，安装和测试（运行项目的依赖）拿不到。没有设置时跳过并在日志里说明。
+- `ANERP_UPGRADE_TOKEN`：只对本仓库的细粒度令牌（或 GitHub App 的令牌），权限 Contents、Pull requests、Issues、Workflows 读写（升级会改 `.github/workflows/` 里的版本号，所以要 Workflows），Checks、Commit statuses 只读（等 PR 的检查结果；缺了会直接报错，不合并）。用它推分支、开 PR、合并：`GITHUB_TOKEN` 开的 PR 不会触发检查。它只交给推送和 `gh` 的几步，不进 `.git/config`，安装和测试（运行项目的依赖）拿不到。没有设置时跳过并在日志里说明。
 
 main 要求 PR 审批时，合并会失败，PR 加上标签等人合并。
 

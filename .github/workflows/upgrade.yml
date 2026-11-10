@@ -21,7 +21,7 @@ on:
         description: 只读令牌：安装 @anerp-platform/* 的包
         required: true
       ANERP_UPGRADE_TOKEN:
-        description: 本仓库的令牌（Contents、Pull requests、Issues、Workflows 读写）：推升级分支、开 PR、合并。用它而不用 GITHUB_TOKEN，PR 的检查才会运行
+        description: 本仓库的令牌（Contents、Pull requests、Issues、Workflows 读写，Checks、Commit statuses 只读）：推升级分支、开 PR、合并。用它而不用 GITHUB_TOKEN，PR 的检查才会运行
         required: false
 
 # anerp check 读豁免引用的 issue
@@ -163,8 +163,14 @@ jobs:
         run: |
           # 推送后检查要过一会儿才出现（GitHub 忙时要好几分钟），最多等 30 分钟
           for _ in $(seq 1 180); do
-            checks=$(gh pr view "$URL" --json statusCheckRollup --jq '.statusCheckRollup | length' || echo 0)
-            [ "${checks:-0}" -gt 0 ] && break
+            if checks=$(gh pr view "$URL" --json statusCheckRollup --jq '.statusCheckRollup | length' 2>&1); then
+              [ "$checks" -gt 0 ] && break
+            elif echo "$checks" | grep -q 'not accessible'; then
+              # 令牌读不了检查：等多久都一样，直接说缺什么
+              echo "::error::ANERP_UPGRADE_TOKEN cannot read the PR's checks (${checks}). Give the token read access to Checks and Commit statuses, then delete the upgrade branch and run this workflow again."
+              echo "merged=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             sleep 10
           done
           if gh pr checks "$URL" --watch --interval 60 && gh pr merge "$URL" --merge --delete-branch; then
