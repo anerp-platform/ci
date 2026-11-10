@@ -99,6 +99,8 @@ jobs:
         if: steps.target.outputs.run == 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.ANERP_READ_TOKEN }}
+          # anerp check：platform/files 用它读插件仓库，豁免用 GITHUB_TOKEN 读 issue（和 check.yml 一样）
+          ANERP_READ_TOKEN: ${{ secrets.ANERP_READ_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.target.outputs.version }}
         run: |
@@ -159,8 +161,8 @@ jobs:
           GH_TOKEN: ${{ secrets.ANERP_UPGRADE_TOKEN }}
           URL: ${{ steps.pr.outputs.url }}
         run: |
-          # 推送后检查要过一会儿才出现
-          for _ in $(seq 1 30); do
+          # 推送后检查要过一会儿才出现（GitHub 忙时要好几分钟），最多等 30 分钟
+          for _ in $(seq 1 180); do
             checks=$(gh pr view "$URL" --json statusCheckRollup --jq '.statusCheckRollup | length' || echo 0)
             [ "${checks:-0}" -gt 0 ] && break
             sleep 10
